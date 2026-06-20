@@ -272,6 +272,30 @@ def _fluency(wpm):
     return round(max(4.0, 10.0 - (wpm - 170) / 15.0), 1)
 
 
+def _fluency_adv(words):
+    # Fluency nâng cao từ timestamp từng từ: tốc độ + ngắt nghỉ + nhịp nói.
+    words = [x for x in (words or []) if x.get("end", 0) > x.get("start", 0)]
+    if len(words) < 2:
+        return None
+    nw = len(words)
+    span = max(0.01, words[-1]["end"] - words[0]["start"])      # tổng thời lượng nói
+    speaking = sum(max(0.0, x["end"] - x["start"]) for x in words)   # thời gian phát âm thực
+    gaps = [max(0.0, words[i + 1]["start"] - words[i]["end"]) for i in range(nw - 1)]
+    pause_total = sum(gaps)
+    n_long = sum(1 for g in gaps if g > 0.3)                    # số lần ngắt > 0.3s (do dự)
+    pause_ratio = pause_total / span
+    wpm = round(nw / span * 60)                                # tốc độ nói (gồm ngắt)
+    artic = round(nw / max(0.01, speaking) * 60)               # nhịp phát âm (bỏ ngắt)
+    # Điểm fluency: nền theo tốc độ, trừ điểm khi ngắt nhiều / do dự
+    fl = _fluency(wpm)
+    fl -= max(0.0, (pause_ratio - 0.20)) * 12.0                # ngắt > 20% thời lượng -> phạt
+    fl -= max(0, n_long - 1) * 0.8                             # >1 lần do dự dài -> phạt
+    fl = round(max(0.0, min(10.0, fl)), 1)
+    return {"fluency": fl, "wpm": wpm, "articulation_rate": artic,
+            "pause_ratio": round(pause_ratio, 2), "pauses": n_long,
+            "pause_sec": round(pause_total, 2)}
+
+
 # ===== Auth + health =====
 @app.before_request
 def _gate():
@@ -368,8 +392,10 @@ def _run(route, audio, params):
 def _score(wav, text, words_hint):
     tnorm = _dnorm(text)
     ntoks = len(tnorm.split()) if tnorm else 0
-    hint = "" if ntoks > 1 else (words_hint if words_hint else text)
-    w = _whisper(wav, "en", hint, fast=True)
+    is_sentence = ntoks > 1
+    hint = "" if is_sentence else (words_hint if words_hint else text)
+    # Câu: fast=False để lấy TIMESTAMP từng từ (phục vụ fluency nâng cao) + transcript chuẩn hơn
+    w = _whisper(wav, "en", hint, fast=(not is_sentence))
     p = _pron_eval(wav, text)
     transcript = (w.get("text") or "").strip()
     pacc = p.get("accuracy") if p.get("ok") else None
@@ -401,14 +427,19 @@ def _score(wav, text, words_hint):
             score = round(3.0 * best, 1); status = "sub"
     out = {"ok": True, "score": score, "status": status, "band": _band(score),
            "heard": transcript, "marks": marks, "phones": phones}
-    if ntoks > 1 and transcript:
-        dur = float(w.get("duration") or 0)
+    if is_sentence and transcript:
         hw = len(_dnorm(transcript).split())
-        wpm = round(hw / dur * 60) if dur > 0 else 0
-        fl = _fluency(wpm); comp = round(min(1.0, hw / max(1, len(tnorm.split()))) * 100)
-        out.update(fluency=fl, wpm=wpm, completeness=comp,
+        comp = round(min(1.0, hw / max(1, len(tnorm.split()))) * 100)
+        adv = _fluency_adv(w.get("words"))
+        if adv is None:   # không có timestamp -> fallback theo tốc độ
+            dur = float(w.get("duration") or 0)
+            wpm = round(hw / dur * 60) if dur > 0 else 0
+            adv = {"fluency": _fluency(wpm), "wpm": wpm}
+        out.update(**adv, completeness=comp,
                    criteria={"accuracy": (None if pacc is None else round(pacc * 100)),
-                             "fluency": fl, "completeness": comp, "wpm": wpm})
+                             "fluency": adv["fluency"], "completeness": comp, "wpm": adv["wpm"],
+                             "articulation_rate": adv.get("articulation_rate"),
+                             "pauses": adv.get("pauses"), "pause_ratio": adv.get("pause_ratio")})
     return out
 
 
