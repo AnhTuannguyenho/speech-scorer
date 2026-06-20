@@ -1,6 +1,6 @@
 # Speech Scorer — RunPod Serverless LOAD BALANCER image (GPU).
 # Chạy Flask HTTP server (app.py) trên PORT (mặc định 80), có /ping cho health check.
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-RUN pip install torch --index-url https://download.pytorch.org/whl/cu124
+RUN pip install torch --index-url https://download.pytorch.org/whl/cu121
 RUN pip install 'numpy<2' faster-whisper transformers flask soundfile phonemizer
 
 COPY app.py /app/
