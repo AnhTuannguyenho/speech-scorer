@@ -39,13 +39,14 @@ API_KEY = os.environ.get("ASR_API_KEY", "").strip()
 app = Flask(__name__)
 _lock = threading.Lock()
 _ready = False
+_gpu_ok = True   # GPU self-test: máy xấu (CUDA no kernel) -> False -> /ping 500 -> RunPod loại worker
 _model = _proc = _w2v = None
 _VOCAB = {}
 _BLANK = 0
 
 
 def _load_models():
-    global _model, _proc, _w2v, _VOCAB, _BLANK, _ready
+    global _model, _proc, _w2v, _VOCAB, _BLANK, _ready, _gpu_ok
     print(f"[engine] loading whisper {MODEL_NAME} on {DEVICE}/{COMPUTE}...", flush=True)
     if DEVICE == "cuda":
         _model = WhisperModel(MODEL_NAME, device="cuda", compute_type=COMPUTE)
@@ -57,8 +58,20 @@ def _load_models():
     _w2v = Wav2Vec2ForCTC.from_pretrained(W2V).eval().to(DEVICE)
     _VOCAB = _proc.tokenizer.get_vocab()
     _BLANK = _proc.tokenizer.pad_token_id
+    # SELF-TEST GPU: chạy thử 1 forward pass wav2vec2 thật trên GPU. Máy driver cũ -> CUDA error ở đây.
+    if DEVICE == "cuda":
+        try:
+            iv = _proc(np.zeros(16000, dtype=np.float32), sampling_rate=16000, return_tensors="pt").input_values.to(DEVICE)
+            with torch.no_grad():
+                _ = _w2v(iv).logits
+            torch.cuda.synchronize()
+            _gpu_ok = True
+            print("[engine] GPU self-test OK", flush=True)
+        except Exception as e:
+            _gpu_ok = False
+            print("[engine] GPU self-test FAILED (host xấu, /ping sẽ trả 500):", e, flush=True)
     _ready = True
-    print("[engine] models ready", flush=True)
+    print("[engine] models ready (gpu_ok=%s)" % _gpu_ok, flush=True)
 
 
 def _calib(p):
@@ -322,8 +335,10 @@ def _cors(resp):
 
 @app.get("/ping")
 def ping():
-    # RunPod Load Balancer health check: 200 sẵn sàng, 204 đang nạp
-    return ("", 200) if _ready else ("", 204)
+    # RunPod LB: 204 đang nạp; 200 sẵn sàng + GPU tốt; 500 GPU xấu -> RunPod loại worker này
+    if not _ready:
+        return ("", 204)
+    return ("", 200) if _gpu_ok else ("", 500)
 
 
 @app.get("/health")
