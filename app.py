@@ -1,30 +1,26 @@
 #!/usr/bin/env python3
-# Speech Scorer — RunPod Serverless (phần mềm chấm phát âm, bản viết mới, gọn).
-# Engine: faster-whisper (ASR) + wav2vec2 phoneme GOP forced-alignment.
-# Handler TRỰC TIẾP (không Flask) — input JSON, audio base64.
-#
-# Input job:
-#   {"input":{"route":"score|grade|grade_ph|transcribe|pron|health",
-#             "text":"apple","audio_b64":"<base64 webm/mp3/wav/m4a...>",
-#             "words":"", "lang":"en", "prompt":"", "fast":true}}
-# Output: dict (score/status/band/heard/phones/fluency... tùy route).
+# Speech Scorer — RunPod Serverless LOAD BALANCER (HTTP server, không qua hàng đợi).
+# Flask listen PORT (mặc định 80). /ping: 200 sẵn sàng | 204 đang nạp model.
+# Routes chấm: /score /grade /grade_ph /transcribe /pron /health
+# Nhận audio: JSON {audio_b64} HOẶC multipart file. Trả JSON trực tiếp.
 import base64
 import math
 import os
 import re
 import subprocess
 import tempfile
+import threading
 import warnings
 
 warnings.filterwarnings("ignore")
 import numpy as np
 import soundfile as sf
 import torch
+from flask import Flask, request, jsonify
 from faster_whisper import WhisperModel
 from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
 from phonemizer import phonemize
 from phonemizer.separator import Separator
-import runpod
 
 # ===== Cấu hình =====
 MODEL_NAME = os.environ.get("ASR_MODEL", "medium.en")
@@ -34,31 +30,41 @@ COMPUTE = os.environ.get("ASR_COMPUTE", "float16" if DEVICE == "cuda" else "int8
 MAX_SEC = int(os.environ.get("ASR_MAX_SEC", "90"))
 MAX_BYTES = 30 * 1024 * 1024
 PH_MIN = float(os.environ.get("ASR_PH_MIN", "0.45"))
-GOP_P0 = float(os.environ.get("ASR_GOP_P0", "0.18"))   # tâm sigmoid hiệu chỉnh GOP
-GOP_K = float(os.environ.get("ASR_GOP_K", "14"))       # độ dốc
+GOP_P0 = float(os.environ.get("ASR_GOP_P0", "0.18"))
+GOP_K = float(os.environ.get("ASR_GOP_K", "14"))
 PH_OK = float(os.environ.get("ASR_PH_OK", "0.60"))
 PH_WARN = float(os.environ.get("ASR_PH_WARN", "0.30"))
+API_KEY = os.environ.get("ASR_API_KEY", "").strip()
 
-# ===== Nạp model (1 lần lúc worker khởi động) =====
-print(f"[engine] loading whisper {MODEL_NAME} on {DEVICE}/{COMPUTE}...", flush=True)
-if DEVICE == "cuda":
-    _model = WhisperModel(MODEL_NAME, device="cuda", compute_type=COMPUTE)
-else:
-    _model = WhisperModel(MODEL_NAME, device="cpu", compute_type=COMPUTE, cpu_threads=4, num_workers=1)
-print(f"[engine] loading wav2vec2 {W2V}...", flush=True)
-torch.set_num_threads(2)
-_proc = Wav2Vec2Processor.from_pretrained(W2V)
-_w2v = Wav2Vec2ForCTC.from_pretrained(W2V).eval().to(DEVICE)
-_VOCAB = _proc.tokenizer.get_vocab()
-_BLANK = _proc.tokenizer.pad_token_id
-print("[engine] models ready", flush=True)
+app = Flask(__name__)
+_lock = threading.Lock()
+_ready = False
+_model = _proc = _w2v = None
+_VOCAB = {}
+_BLANK = 0
+
+
+def _load_models():
+    global _model, _proc, _w2v, _VOCAB, _BLANK, _ready
+    print(f"[engine] loading whisper {MODEL_NAME} on {DEVICE}/{COMPUTE}...", flush=True)
+    if DEVICE == "cuda":
+        _model = WhisperModel(MODEL_NAME, device="cuda", compute_type=COMPUTE)
+    else:
+        _model = WhisperModel(MODEL_NAME, device="cpu", compute_type=COMPUTE, cpu_threads=4, num_workers=1)
+    print(f"[engine] loading wav2vec2 {W2V}...", flush=True)
+    torch.set_num_threads(2)
+    _proc = Wav2Vec2Processor.from_pretrained(W2V)
+    _w2v = Wav2Vec2ForCTC.from_pretrained(W2V).eval().to(DEVICE)
+    _VOCAB = _proc.tokenizer.get_vocab()
+    _BLANK = _proc.tokenizer.pad_token_id
+    _ready = True
+    print("[engine] models ready", flush=True)
 
 
 def _calib(p):
     return 1.0 / (1.0 + math.exp(-GOP_K * (p - GOP_P0)))
 
 
-# ===== Audio =====
 def to_wav(src):
     dst = src + ".wav"
     subprocess.run(["ffmpeg", "-y", "-i", src, "-t", str(MAX_SEC), "-ar", "16000", "-ac", "1", "-f", "wav", dst],
@@ -66,7 +72,6 @@ def to_wav(src):
     return dst
 
 
-# ===== Âm vị (espeak target + wav2vec2 nhận dạng) =====
 def _strip_p(p):
     for c in ('ˈ', 'ˌ', 'ː', 'ˑ', 'ʰ', '̩', '̃', 'ʲ'):
         p = p.replace(c, '')
@@ -191,7 +196,6 @@ def align_phones(tgt, hyp):
     return st, ok, d[la][lb]
 
 
-# ===== Whisper =====
 def _whisper(wav, lang="en", hint="", fast=False):
     segments, info = _model.transcribe(
         wav, language=(None if lang == "auto" else lang),
@@ -216,7 +220,6 @@ def _pron_eval(wav, text):
             "phones": [{"p": tgt[k], "status": st[k]} for k in range(len(tgt))]}
 
 
-# ===== Tiện ích chấm câu =====
 def _dnorm(s):
     s = (s or "").lower()
     s = re.sub(r"[^\w\s]", " ", s, flags=re.UNICODE)
@@ -269,35 +272,100 @@ def _fluency(wpm):
     return round(max(4.0, 10.0 - (wpm - 170) / 15.0), 1)
 
 
-# ===== Orchestration từng route =====
-def do_transcribe(wav, lang, hint, fast):
-    r = _whisper(wav, lang, hint, fast)
-    return {"ok": True, **r}
+# ===== Auth + health =====
+@app.before_request
+def _gate():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if request.path in ("/ping", "/health"):
+        return None
+    if API_KEY:
+        k = request.headers.get("X-API-Key") or request.args.get("key")
+        # RunPod Load Balancer chèn Authorization: Bearer; chấp nhận luôn
+        auth = (request.headers.get("Authorization") or "")
+        if k != API_KEY and not auth.startswith("Bearer "):
+            return jsonify(ok=False, err="unauthorized"), 401
+    return None
 
 
-def do_pron(wav, text):
-    r = _pron_eval(wav, text)
-    return r if r.get("ok") else {"ok": False, "err": r.get("err", "pron")}
+@app.after_request
+def _cors(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "X-API-Key, Content-Type, Authorization"
+    resp.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS"
+    return resp
 
 
-def do_grade(wav, text, hint):
-    w = _whisper(wav, "en", hint, fast=True)
-    p = _pron_eval(wav, text)
-    out = {"ok": True, "text": w["text"], "duration": w["duration"]}
-    if p.get("ok"):
-        out.update(accuracy=p["accuracy"], target=p["target"], said=p["said"], phones=p["phones"])
-    return out
+@app.get("/ping")
+def ping():
+    # RunPod Load Balancer health check: 200 sẵn sàng, 204 đang nạp
+    return ("", 200) if _ready else ("", 204)
 
 
-def do_grade_ph(wav, current):
-    r = _gop_eval(wav, current)
-    if not r.get("ok"):
-        return r
-    r["word_ok"] = (r["accuracy"] / 100.0 >= PH_MIN) and bool(r.get("said"))
-    return r
+@app.get("/health")
+def health():
+    return jsonify(ok=_ready, model=MODEL_NAME, w2v=W2V, device=DEVICE)
 
 
-def do_score(wav, text, words_hint):
+# ===== Lấy audio + tham số (JSON base64 hoặc multipart) =====
+def _extract(req):
+    if req.is_json:
+        j = req.get_json(silent=True) or {}
+        b64 = j.get("audio_b64") or j.get("audio")
+        audio = base64.b64decode(b64) if b64 else None
+        return audio, j
+    f = req.files.get("file") or req.files.get("audio")
+    audio = f.read() if f else None
+    return audio, req.form
+
+
+def _run(route, audio, params):
+    text = (params.get("text") or "").strip()
+    if route in ("score", "grade", "grade_ph", "pron") and not text:
+        return {"ok": False, "err": "no text"}, 400
+    tmpd = tempfile.mkdtemp(prefix="ss_"); src = os.path.join(tmpd, "in"); wav = None
+    try:
+        with open(src, "wb") as f:
+            f.write(audio)
+        wav = to_wav(src)
+        lang = params.get("lang") or "en"
+        hint = (params.get("prompt") or "").strip()[:400]
+        fast = str(params.get("fast", "")).lower() in ("1", "true", "yes")
+        with _lock:
+            if route == "transcribe":
+                return {"ok": True, **_whisper(wav, lang, hint, fast)}, 200
+            if route == "pron":
+                r = _pron_eval(wav, text)
+                return (r if r.get("ok") else {"ok": False, "err": r.get("err", "pron")}), 200
+            if route == "grade":
+                w = _whisper(wav, "en", hint, fast=True); p = _pron_eval(wav, text)
+                out = {"ok": True, "text": w["text"], "duration": w["duration"]}
+                if p.get("ok"):
+                    out.update(accuracy=p["accuracy"], target=p["target"], said=p["said"], phones=p["phones"])
+                return out, 200
+            if route == "grade_ph":
+                r = _gop_eval(wav, text)
+                if r.get("ok"):
+                    r["word_ok"] = (r["accuracy"] / 100.0 >= PH_MIN) and bool(r.get("said"))
+                return r, 200
+            return _score(wav, text, (params.get("words") or "").strip()), 200
+    except subprocess.CalledProcessError:
+        return {"ok": False, "err": "audio decode failed"}, 400
+    except Exception as e:
+        return {"ok": False, "err": str(e)}, 500
+    finally:
+        for p in (src, wav):
+            try:
+                if p and os.path.exists(p): os.remove(p)
+            except Exception:
+                pass
+        try:
+            os.rmdir(tmpd)
+        except Exception:
+            pass
+
+
+def _score(wav, text, words_hint):
     tnorm = _dnorm(text)
     ntoks = len(tnorm.split()) if tnorm else 0
     hint = "" if ntoks > 1 else (words_hint if words_hint else text)
@@ -333,78 +401,42 @@ def do_score(wav, text, words_hint):
             score = round(3.0 * best, 1); status = "sub"
     out = {"ok": True, "score": score, "status": status, "band": _band(score),
            "heard": transcript, "marks": marks, "phones": phones}
-    # Fluency + completeness cho CÂU (IELTS)
     if ntoks > 1 and transcript:
         dur = float(w.get("duration") or 0)
         hw = len(_dnorm(transcript).split())
         wpm = round(hw / dur * 60) if dur > 0 else 0
-        fl = _fluency(wpm)
-        comp = round(min(1.0, hw / max(1, len(tnorm.split()))) * 100)
+        fl = _fluency(wpm); comp = round(min(1.0, hw / max(1, len(tnorm.split()))) * 100)
         out.update(fluency=fl, wpm=wpm, completeness=comp,
                    criteria={"accuracy": (None if pacc is None else round(pacc * 100)),
                              "fluency": fl, "completeness": comp, "wpm": wpm})
     return out
 
 
-ROUTES = {"score", "grade", "grade_ph", "transcribe", "pron"}
+def _route(route):
+    if not _ready:
+        return jsonify(ok=False, err="model loading"), 503
+    audio, params = _extract(request)
+    if not audio:
+        return jsonify(ok=False, err="no audio"), 400
+    if len(audio) > MAX_BYTES:
+        return jsonify(ok=False, err="audio too large"), 413
+    out, code = _run(route, audio, params)
+    return jsonify(**out), code
 
 
-def handler(job):
-    inp = job.get("input") or {}
-    route = (inp.get("route") or "score").strip()
-    if route == "health":
-        return {"ok": True, "model": MODEL_NAME, "w2v": W2V, "device": DEVICE}
-    if route not in ROUTES:
-        return {"ok": False, "err": f"unknown route '{route}'"}
-
-    b64 = inp.get("audio_b64") or inp.get("audio")
-    if not b64:
-        return {"ok": False, "err": "no audio (cần 'audio_b64')"}
-    try:
-        audio = base64.b64decode(b64)
-    except Exception as e:
-        return {"ok": False, "err": f"base64 decode failed: {e}"}
-    if not audio or len(audio) > MAX_BYTES:
-        return {"ok": False, "err": "audio rỗng hoặc quá lớn"}
-
-    text = (inp.get("text") or "").strip()
-    if route in ("score", "grade", "grade_ph", "pron") and not text:
-        return {"ok": False, "err": "no text"}
-
-    tmpd = tempfile.mkdtemp(prefix="ss_")
-    src = os.path.join(tmpd, "in")
-    wav = None
-    try:
-        with open(src, "wb") as f:
-            f.write(audio)
-        wav = to_wav(src)
-        lang = (inp.get("lang") or "en")
-        hint = (inp.get("prompt") or "").strip()[:400]
-        fast = str(inp.get("fast", "")).lower() in ("1", "true", "yes")
-        if route == "transcribe":
-            return do_transcribe(wav, lang, hint, fast)
-        if route == "pron":
-            return do_pron(wav, text)
-        if route == "grade":
-            return do_grade(wav, text, hint)
-        if route == "grade_ph":
-            return do_grade_ph(wav, text)
-        return do_score(wav, text, (inp.get("words") or "").strip())
-    except subprocess.CalledProcessError:
-        return {"ok": False, "err": "audio decode failed"}
-    except Exception as e:
-        return {"ok": False, "err": str(e)}
-    finally:
-        for p in (src, wav):
-            try:
-                if p and os.path.exists(p): os.remove(p)
-            except Exception:
-                pass
-        try:
-            os.rmdir(tmpd)
-        except Exception:
-            pass
+@app.post("/score")
+def r_score(): return _route("score")
+@app.post("/grade")
+def r_grade(): return _route("grade")
+@app.post("/grade_ph")
+def r_grade_ph(): return _route("grade_ph")
+@app.post("/transcribe")
+def r_transcribe(): return _route("transcribe")
+@app.post("/pron")
+def r_pron(): return _route("pron")
 
 
 if __name__ == "__main__":
-    runpod.serverless.start({"handler": handler})
+    threading.Thread(target=_load_models, daemon=True).start()
+    port = int(os.environ.get("PORT", "80"))
+    app.run(host="0.0.0.0", port=port, threaded=True)

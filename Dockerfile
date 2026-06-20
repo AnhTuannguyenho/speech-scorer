@@ -1,11 +1,12 @@
-# Speech Scorer — RunPod Serverless image (GPU). Engine chấm phát âm.
-# faster-whisper + wav2vec2. Model nướng sẵn vào image -> cold-start không tải mạng.
+# Speech Scorer — RunPod Serverless LOAD BALANCER image (GPU).
+# Chạy Flask HTTP server (app.py) trên PORT (mặc định 80), có /ping cho health check.
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     HF_HOME=/models \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PORT=80
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip ffmpeg espeak-ng libsndfile1 \
@@ -14,14 +15,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# torch CUDA 12.4
 RUN pip install torch --index-url https://download.pytorch.org/whl/cu124
-# Engine deps + RunPod SDK
-RUN pip install 'numpy<2' faster-whisper transformers soundfile phonemizer runpod
+RUN pip install 'numpy<2' faster-whisper transformers flask soundfile phonemizer
 
-COPY handler.py /app/
+COPY app.py /app/
 
-# Nướng sẵn model (CPU lúc build)
+# Nướng sẵn model
 ARG ASR_MODEL=medium.en
 ENV ASR_MODEL=${ASR_MODEL}
 RUN python - <<'PY'
@@ -37,4 +36,5 @@ print("models cached")
 PY
 
 ENV ASR_DEVICE=cuda ASR_COMPUTE=float16
-CMD ["python", "-u", "handler.py"]
+EXPOSE 80
+CMD ["python", "-u", "app.py"]

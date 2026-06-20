@@ -1,27 +1,35 @@
-# Speech Scorer — RunPod Serverless
+# Speech Scorer — RunPod Serverless (Load Balancer)
 
-Phần mềm chấm phát âm (viết mới, gọn). Engine: **faster-whisper** (ASR) + **wav2vec2** phoneme GOP forced-alignment. Handler TRỰC TIẾP (không Flask).
+Phần mềm chấm phát âm. Engine: **faster-whisper** (ASR) + **wav2vec2** phoneme GOP.
+Chạy theo chế độ **Load Balancer** của RunPod — request đi **thẳng HTTP tới worker, KHÔNG qua hàng đợi** (né lỗi dispatcher), độ trễ thấp.
 
-## Gọi
+## Cách hoạt động (Load Balancer)
+- App là **Flask HTTP server** nghe cổng `PORT` (mặc định 80).
+- `/ping`: **200** = sẵn sàng, **204** = đang nạp model (RunPod tự đợi).
+- Model nạp ở luồng nền → worker phản hồi /ping ngay khi container chạy.
+
+## Tạo endpoint
+Console → New Endpoint → Import Git Repository `AnhTuannguyenho/speech-scorer` → **Advanced settings → chọn `Load balancer`** → Deploy.
+- GPU 16GB+ · Dockerfile `Dockerfile` · (PORT mặc định 80, không cần đổi)
+
+## Gọi (client / web khác)
 ```
-POST https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync
+POST https://<ENDPOINT_ID>.api.runpod.ai/score
 Authorization: Bearer <RUNPOD_API_KEY>
 Content-Type: application/json
-Body: {"input":{"route":"score","text":"apple","audio_b64":"<base64 audio>"}}
+Body: {"text":"apple","audio_b64":"<base64 audio>"}
 ```
-Kết quả nằm trong `.output`.
+→ Trả JSON TRỰC TIẾP (không bọc `.output`): `{ok, score, status, band, heard, phones, fluency...}`
+
+Cũng nhận **multipart** (`file=@audio` + `text=`) nếu muốn gửi file thẳng (đỡ base64).
 
 ## Routes
-| route | input | output |
+| path | input | output |
 |---|---|---|
-| `score` | text, audio_b64 [,words] | score(0-10), status, band, heard, marks, phones, fluency/wpm/completeness/criteria (câu) |
-| `grade` | text, audio_b64 [,prompt] | text, accuracy, phones, duration |
-| `grade_ph` | text, audio_b64 | accuracy, word_ok, phones, said (chấm 1 từ bằng âm vị) |
-| `transcribe` | audio_b64 [,lang,prompt,fast] | text, words[], duration |
-| `pron` | text, audio_b64 | accuracy, target, said, phones |
-| `health` | — | model, w2v, device |
-
-`audio_b64`: base64 file audio (webm/mp3/wav/m4a/aiff…), engine tự ffmpeg.
-
-## Build/Deploy
-Tạo endpoint RunPod Serverless từ repo này (Dockerfile ở gốc). GPU 16GB+ đủ. Model nướng sẵn trong image. Đổi model: `--build-arg ASR_MODEL=small.en` (nhẹ/nhanh hơn).
+| `POST /score` | text, audio_b64 [,words] | score(0-10), status, band, heard, marks, phones, fluency/wpm/completeness/criteria(câu) |
+| `POST /grade` | text, audio_b64 [,prompt] | text, accuracy, phones, duration |
+| `POST /grade_ph` | text, audio_b64 | accuracy, word_ok, phones, said |
+| `POST /transcribe` | audio_b64 [,lang,prompt,fast] | text, words[], duration |
+| `POST /pron` | text, audio_b64 | accuracy, target, said, phones |
+| `GET /health` | — | model, w2v, device, ok |
+| `GET /ping` | — | 200/204 (health check RunPod) |
